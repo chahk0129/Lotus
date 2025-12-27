@@ -1,0 +1,12 @@
+=s
+# a list of servers; each on a new line
+node0.hcha-284738.nextgendb-pg0.utah.cloudlab.us
+node1.hcha-284738.nextgendb-pg0.utah.cloudlab.us
+node2.hcha-284738.nextgendb-pg0.utah.cloudlab.us
+node3.hcha-284738.nextgendb-pg0.utah.cloudlab.us
+=c
+# a list of clients; each on a new line
+node0.hcha-284738.nextgendb-pg0.utah.cloudlab.us
+node1.hcha-284738.nextgendb-pg0.utah.cloudlab.us
+node2.hcha-284738.nextgendb-pg0.utah.cloudlab.us
+node3.hcha-284738.nextgendb-pg0.utah.cloudlab.us

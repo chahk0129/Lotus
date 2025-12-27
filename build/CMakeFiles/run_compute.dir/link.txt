@@ -1,0 +1,1 @@
+/usr/bin/c++  -march=native -Wno-deprecated-declarations  -march=native -Wno-deprecated-declarations -O3 CMakeFiles/run_compute.dir/test/main.cpp.o -o run_compute  libdb_core.a -lpthread -libverbs -lpthread -libverbs -ljemalloc -lcityhash -lboost_system -lboost_coroutine 

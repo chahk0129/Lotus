@@ -1,0 +1,30 @@
+{
+    "RUN_TIME": 10,
+    "WARMUP_TIME": 10,
+    "NDEBUG": "false",
+    "STATS_ENABLE": "true",
+    "TIME_ENABLE": "true",
+    "COLLECT_LATENCY": "true",
+    "TRANSPORT": "TWO_SIDED",
+    "BATCH": 1,
+    "PARTITIONED": "false",
+
+    "RPC_RATE": 0.1,
+    "CACHE_SIZE": 128,
+    "CACHE_ADMISSION_RATE": 0.5,
+
+    "NUM_SERVER_THREADS": 8,
+    "NUM_CLIENT_THREADS": 40,
+
+    "TXN_TYPE": "STORED_PROCEDURE",
+    "CC_ALG": "WAIT_DIE",
+
+    "WORKLOAD": "YCSB",
+    "SYNTH_TABLE_SIZE": 10000000,
+    "ZIPF_THETA": 0.9,
+    "REQ_PER_QUERY": 16,
+    "READ_PERC": 1.0,
+    "UPDATE_PERC": 0.0,
+    "INSERT_PERC": 0.0,
+    "SCAN_PERC": 0.0
+}

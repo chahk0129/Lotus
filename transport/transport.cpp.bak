@@ -1,0 +1,1315 @@
+#include "system/global.h"
+#include "system/manager.h"
+#include "system/memory_region.h"
+#include "transport/transport.h"
+#include "transport/message.h"
+#include "utils/helper.h"
+#include "utils/debug.h"
+#include <fcntl.h>
+#include <cstring>
+#include <netinet/tcp.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <fstream>
+
+#define PRINT_DEBUG_INFO false
+
+// The socket code is borrowed from
+// http://easy-tutorials.net/c/linux-c-socket-programming/
+// The external program execution code is borrowed from http://stackoverflow.com/questions/478898/how-to-execute-a-command-and-get-output-of-command-within-c-using-posix
+transport_t::transport_t() {
+    read_urls();
+}
+
+transport_t::~transport_t() {
+    cleanup();
+}
+
+bool transport_t::init() {
+    char hostname[1024];
+    memset(hostname, '\0', 1024);
+    gethostname(hostname, 1023);
+    uint32_t global_node_id = -1;
+    // Determine the global node ID based on the hostname
+    // and the URLs read from the configuration file.
+    if (g_is_server) { 
+        for(uint32_t i=0; i<g_num_server_nodes; i++) {
+            if (_server_urls[i] == std::string(hostname)) {
+                global_node_id = i;
+                break;
+            }
+        }
+    }
+    else {
+        assert(g_is_server == false);
+        for(uint32_t i=0; i<g_num_client_nodes; i++) {
+            if (_client_urls[i] == std::string(hostname)) {
+                global_node_id = i;
+                break;
+            }
+        }
+    }
+
+    assert(global_node_id != -1);
+    g_node_id = global_node_id;
+    printf("NodeID: %u, \tHostname: %s\n", g_node_id, hostname);
+    if(g_is_server) g_num_nodes = g_num_client_nodes;
+    else g_num_nodes = g_num_server_nodes;
+
+    // initialize communication buffers and structures
+    _local_info = new addrinfo[g_num_nodes];
+    _remote_info = new addrinfo[g_num_nodes];
+
+    _local_sockets = new int[g_num_nodes];
+    _remote_sockets = new int[g_num_nodes];
+
+    _send_buffer = new char*[g_num_nodes];
+    _recv_buffer = new char*[g_num_nodes];
+    _recv_buffer_lower = new uint32_t[g_num_nodes];
+    _recv_buffer_upper = new uint32_t[g_num_nodes];
+
+    for(uint32_t i=0; i<g_num_nodes; i++) {
+        _send_buffer[i] = new char[MAX_MESSAGE_SIZE];
+        _recv_buffer[i] = new char[MAX_MESSAGE_SIZE];
+        _recv_buffer_lower[i] = 0;
+        _recv_buffer_upper[i] = 0;
+    }
+    return true;
+}
+
+bool transport_t::connect() {
+    // Create lock socket for each node
+    memset(_local_sockets, 0, sizeof(int) * g_num_nodes);
+    memset(_local_info, 0, sizeof(addrinfo) * g_num_nodes);
+    for(uint32_t i=0; i<g_num_nodes; i++) {
+        _local_info[i].ai_family = AF_UNSPEC;    // Allow IPv4 or IPv6
+        _local_info[i].ai_socktype = SOCK_STREAM;// SOCK_STREAM for TCP or SOCK_DGRAM for UDP
+        _local_info[i].ai_flags = AI_PASSIVE;
+
+        struct addrinfo* host_info_list;
+        uint32_t port_num = get_port_num(i, g_is_server);
+        printf("Binding to port %u\n", port_num);
+        int status = getaddrinfo(nullptr, std::to_string(port_num).c_str(), &_local_info[i], &host_info_list);
+        assert(status == 0);
+
+        // create socket
+        int sockfd = socket(host_info_list->ai_family, host_info_list->ai_socktype, host_info_list->ai_protocol);
+        uint32_t buffer_size = MAX_MESSAGE_SIZE;
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(uint32_t));
+
+        int flag = 1;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int));
+
+        _local_sockets[i] = sockfd;
+        assert(_local_sockets[i] != -1);
+
+        // bind socket
+        int op = 1;
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &op, sizeof(int));
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &op, sizeof(int));
+        status = bind(sockfd, host_info_list->ai_addr, host_info_list->ai_addrlen);
+        if (status == -1) {
+            int bind_errno = errno;
+            printf("ERROR: bind() failed for port %s\n", std::to_string(get_port_num(i, g_is_server)).c_str());
+            printf("Error: %s (errno: %d)\n", strerror(bind_errno), bind_errno);
+            printf("Socket: %d, Node: %u, Is Server: %d\n", sockfd, i, g_is_server);
+            
+            // Check what's using this port
+            std::string cmd = "netstat -tlnp | grep :" + std::to_string(get_port_num(i, g_is_server));
+            printf("Checking port usage: %s\n", cmd.c_str());
+            system(cmd.c_str());
+        }
+        assert(status != -1);
+        status = listen(sockfd, 5);
+        assert(status != -1);
+        fcntl(sockfd, F_SETFL, O_NONBLOCK); // Set socket to non-blocking mode
+    }
+    printf("Local sockets initialized\n");
+    
+    // Establish connections with remote nodes
+    memset(_remote_sockets, 0, sizeof(int) * g_num_nodes);
+    memset(_remote_info, 0, sizeof(addrinfo) * g_num_nodes);
+    for(uint32_t i=0; i<g_num_nodes; i++) {
+        _remote_info[i].ai_family = AF_UNSPEC;    // Allow IPv4 or IPv6
+        _remote_info[i].ai_socktype = SOCK_STREAM; // SOCK_STREAM for TCP or SOCK_DGRAM for UDP
+        
+        struct addrinfo* host_info_list = nullptr;
+        std::string node_name = g_is_server ? _client_urls[i] : _server_urls[i];
+        uint32_t port_num = get_port_num(i, !g_is_server);
+        printf("Connecting to node %u at %s:%u\n", i, node_name.c_str(), port_num);
+        // std::string port_num = std::to_string(get_port_num(g_node_id, !g_is_server));
+        int status;
+        do {
+            status = getaddrinfo(node_name.c_str(), std::to_string(port_num).c_str(), &_remote_info[i], &host_info_list);
+        } while(status != 0);
+
+        // create socket
+        int sockfd;
+        do {
+            sockfd = socket(host_info_list->ai_family, host_info_list->ai_socktype, host_info_list->ai_protocol);
+        } while(sockfd == -1);
+        _remote_sockets[i] = sockfd;
+
+        do {
+            status = ::connect(sockfd, host_info_list->ai_addr, host_info_list->ai_addrlen);
+            PAUSE
+        } while(status == -1);
+
+        uint32_t buffer_size = MAX_MESSAGE_SIZE;
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(uint32_t));
+        int flag = 1;
+        int res = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int));
+        assert(res != -1);
+
+        setsockopt(sockfd, SOL_SOCKET, TCP_QUICKACK, &flag, sizeof(int));
+    }
+
+    // Accept connection from remote nodes
+    for(uint32_t i=0; i<g_num_nodes; i++) {
+        int new_fd;
+        struct sockaddr_storage their_addr;
+        socklen_t addr_size = sizeof(their_addr);
+        int sockfd = _local_sockets[i];
+        do {
+            new_fd = accept(sockfd, (struct sockaddr*)&their_addr, &addr_size);
+        } while(new_fd == -1);
+        _local_sockets[i] = new_fd;
+        fcntl(new_fd, F_SETFL, O_NONBLOCK); // Set socket to non-blocking mode
+    }
+    printf("Remote sockets initialized\n");
+    return true;
+}
+
+void transport_t::close_sockets() {
+    if (_remote_sockets) {
+        for(uint32_t i=0; i<g_num_nodes; i++) {
+            if (_remote_sockets[i] > 0) {
+                shutdown(_remote_sockets[i], SHUT_RDWR);
+                ::close(_remote_sockets[i]);
+                _remote_sockets[i] = -1;
+            }
+        }
+        delete[] _remote_sockets;
+        _remote_sockets = nullptr;
+    }
+
+    if (_local_sockets) {
+        for(uint32_t i=0; i<g_num_nodes; i++) {
+            if(_local_sockets[i] > 0) {
+                shutdown(_local_sockets[i], SHUT_RDWR);
+                ::close(_local_sockets[i]);
+                _local_sockets[i] = -1;
+            }
+        }
+        delete[] _local_sockets;
+        _local_sockets = nullptr;
+    }
+
+    if (_local_info) {
+        delete[] _local_info;
+        _local_info = nullptr;
+    }
+    
+    if (_remote_info) {
+        delete[] _remote_info;
+        _remote_info = nullptr;
+    }
+
+    if (_send_buffer) {
+        for(uint32_t i=0; i<g_num_nodes; i++) {
+            if (_send_buffer[i]) {
+                delete[] _send_buffer[i];
+                _send_buffer[i] = nullptr;
+            }
+        }
+        delete[] _send_buffer;
+        _send_buffer = nullptr;
+    }
+
+    if (_recv_buffer) {
+        for(uint32_t i=0; i<g_num_nodes; i++) {
+            if (_recv_buffer[i]) {
+                delete[] _recv_buffer[i];
+                _recv_buffer[i] = nullptr;
+            }
+        }
+        delete[] _recv_buffer;
+        _recv_buffer = nullptr;
+    }
+
+    if (_recv_buffer_lower) {
+        delete[] _recv_buffer_lower;
+        _recv_buffer_lower = nullptr;
+    }
+
+    if (_recv_buffer_upper) {
+        delete[] _recv_buffer_upper;
+        _recv_buffer_upper = nullptr;
+    }
+}
+
+void transport_t::sendMsg(message_t* msg, uint32_t node_id) {
+    uint32_t packet_size = msg->get_packet_len();
+    char data[packet_size];
+    msg->to_packet(data);
+    uint32_t bytes_sent = 0;
+    while (bytes_sent < packet_size) {
+        int bytes = ::send(_remote_sockets[node_id], data + bytes_sent, packet_size - bytes_sent, 0);
+        if(bytes > 0)
+            bytes_sent += bytes;
+    }
+    #if PRINT_DEBUG_INFO
+    printf("\033[1;31m[QP_ID=%5ld] Send %d->%d %16s [%4d bytes] fd=%d \033[0m\n",
+           msg->get_qp_id(), GLOBAL_NODE_ID, node_id, msg->get_name().c_str(), bytes_sent,
+           _remote_sockets[node_id]);
+    #endif
+
+}
+
+message_t* transport_t::recvMsg() {
+    ssize_t bytes = 0;
+    uint32_t global_node_id = g_node_id;
+    for (uint32_t i=0; i<g_num_nodes; i++) {
+        uint32_t node_id = i;
+
+        if (_recv_buffer_upper[node_id] - _recv_buffer_lower[node_id] <= MAX_MESSAGE_SIZE) {
+            // not enough bytes in the recv buffer
+            if (MAX_MESSAGE_SIZE - _recv_buffer_upper[node_id] < MAX_MESSAGE_SIZE / 4) {
+                // Buffer is almost full, shift it
+                memmove(_recv_buffer[node_id], 
+                        _recv_buffer[node_id] + _recv_buffer_lower[node_id], 
+                        _recv_buffer_upper[node_id] - _recv_buffer_lower[node_id]);
+                _recv_buffer_upper[node_id] -= _recv_buffer_lower[node_id];
+                _recv_buffer_lower[node_id] = 0;
+            }
+
+            uint32_t max_size = MAX_MESSAGE_SIZE - _recv_buffer_upper[node_id];
+            bytes = ::recv(_local_sockets[i], _recv_buffer[node_id] + _recv_buffer_upper[node_id], max_size, MSG_DONTWAIT);
+            if (bytes > 0)
+                _recv_buffer_upper[node_id] += bytes;
+        }
+
+        if (_recv_buffer_upper[node_id] - _recv_buffer_lower[node_id] >= sizeof(message_t)) {
+            auto msg = (message_t*)(_recv_buffer[node_id] + _recv_buffer_lower[node_id]);
+            assert(msg->get_packet_len() < MAX_MESSAGE_SIZE);
+            if (_recv_buffer_upper[node_id] - _recv_buffer_lower[node_id] >= msg->get_packet_len()) {
+                // Find a valid input message
+                msg = new message_t(_recv_buffer[node_id] + _recv_buffer_lower[node_id]); 
+                _recv_buffer_lower[node_id] += msg->get_packet_len();
+                if (_recv_buffer_upper[node_id] == _recv_buffer_lower[node_id]) {
+                    // a small optimization
+                    _recv_buffer_lower[node_id] = 0;
+                    _recv_buffer_upper[node_id] = 0;
+                }
+                #if PRINT_DEBUG_INFO
+                printf("\033[1;32m[TxnID=%5ld] recv %d<-%d %16s [%4d bytes] fd=%d \033[0m\n",
+                       msg->get_txn_id(), global_node_id, node_id, 
+                       msg->get_name().c_str(), msg->get_packet_len(),
+                       _local_sockets[node_id]);
+                #endif
+                return msg;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void transport_t::read_urls() {
+    // get server names
+    std::string line = "";
+    std::ifstream file(ifconfig_file);
+    assert(file.is_open());
+
+    uint32_t num_server_nodes = 0;
+    uint32_t num_client_nodes = 0;
+    uint32_t node_type = -1;
+    while (std::getline(file, line)) {
+        if (line[0] == '#')
+            continue; // skip comments
+        else if (line[0] == '=') {
+            switch (line[1]) {
+                case 'c' : node_type = 0; break; // client
+                case 's' : node_type = 1; break; // server
+                default: node_type = -1; break; // unknown
+            }
+        }
+        else {
+            switch (node_type) {
+                case 0: { num_client_nodes++; _client_urls.push_back(line); break; }
+                case 1: { num_server_nodes++; _server_urls.push_back(line); break; }
+                default: { assert(false); }
+            }
+        }
+    }
+
+    assert(num_client_nodes > 0 && num_server_nodes > 0);
+    g_num_client_nodes = num_client_nodes;
+    g_num_server_nodes = num_server_nodes;
+
+    file.close();
+}
+
+uint32_t transport_t::get_port_num(uint32_t node_id, bool is_server) {
+    uint32_t base_port = START_PORT;
+    if (is_server) return base_port + node_id + g_num_nodes;
+    else return base_port + node_id;
+    // if (is_server)
+    //     return START_PORT + g_num_nodes + node_id;
+    // else 
+    //     return START_PORT + node_id;
+}
+
+bool transport_t::init_rdma() {
+    memset(&_context, 0, sizeof(struct rdma_ctx));
+
+    _context.gid_idx = 0;
+    _context.ctx = open_device();
+    if (!_context.ctx) return cleanup();
+
+    _context.pd = alloc_pd(_context.ctx);
+    if (!_context.pd) return cleanup();
+
+    bool ret = query_attr(_context.ctx, _context.port_attr, _context.gid_idx, _context.gid);
+    if (!ret) return cleanup();
+
+    // QPs and CQs are initialized in the derived classes
+    // Clients and servers have different # of QPs and CQs
+
+    // we allocate memory regions for each node (this MR is only for two-sided RDMA)
+    //// buffer layout for server
+    ////// [ send region * g_num_server_threads | recv region * g_num_client_threads * g_num_client_nodes ]
+    //// buffer layout for client
+    ////// [ send region * g_num_client_threads | recv region * g_num_server_threads * g_num_server_nodes ]
+    uint64_t global_num_send_threads = g_is_server ? g_num_server_threads : g_num_client_threads;
+    uint64_t global_num_recv_threads = g_num_client_threads;
+    //uint64_t global_num_recv_threads = g_is_server ? g_num_client_threads : g_num_server_threads;
+    _rdma_send_buffer_size = MAX_MESSAGE_SIZE * global_num_send_threads;
+    _rdma_recv_buffer_size = MAX_MESSAGE_SIZE * global_num_recv_threads;
+
+    uint64_t total_size_recv = _rdma_recv_buffer_size * g_num_nodes;
+    uint64_t total_size_send = _rdma_send_buffer_size;
+    uint64_t total_size = total_size_recv + total_size_send;
+    _memory_region = new memory_region_t(total_size);
+
+    // for send, we only need the space for the local threads 
+    _rdma_send_buffer = new char*[global_num_send_threads];
+    char* send_base = reinterpret_cast<char*>(_memory_region->ptr());
+    for (uint32_t i=0; i<global_num_send_threads; i++)
+        _rdma_send_buffer[i] = send_base + MAX_MESSAGE_SIZE * i;
+
+    // for recv, we need the space for all client threads
+    _rdma_recv_buffer = new char**[g_num_nodes];
+    char* recv_base = reinterpret_cast<char*>(_memory_region->ptr()) + total_size_send;
+    for (uint32_t i=0; i<g_num_nodes; i++) {
+        _rdma_recv_buffer[i] = new char*[global_num_recv_threads];
+        char* recv_base_i = recv_base + i * _rdma_recv_buffer_size;
+        for (uint32_t j=0; j<global_num_recv_threads; j++)
+            _rdma_recv_buffer[i][j] = recv_base_i + j * MAX_MESSAGE_SIZE;
+    }
+
+    return true;
+}
+
+bool transport_t::cleanup() {
+    if(_memory_region) {
+        delete _memory_region;
+        _memory_region = nullptr;
+    }
+    if(_context.pd) ibv_dealloc_pd(_context.pd);
+    if(_context.ctx) ibv_close_device(_context.ctx);
+
+    close_sockets();
+    return false;
+}
+
+struct ibv_context* transport_t::open_device() {
+    struct ibv_device** dev_list = nullptr;
+    struct ibv_device* dev = nullptr;
+    int flags = 0;
+    int dev_num = 0;
+
+    dev_list = ibv_get_device_list(&dev_num);
+    if (!dev_list || !dev_num){
+        debug::notify_error("Failed to ibv_get_device_list");
+        return nullptr;
+    }
+
+    for (int i=0; i<dev_num; i++) {
+        // if(ibv_get_device_name(dev_list[i])[5] == '0') { // open mlx5_0
+        if (ibv_get_device_name(dev_list[i])[5] == '2') { // open mlx5_2
+            dev = dev_list[i];
+            debug::notify_info("Opening %s\n", ibv_get_device_name(dev_list[i]));
+            break;
+        }
+    }
+
+    if (!dev) {
+        debug::notify_error("Failed to find IB device");
+        return nullptr;
+    }
+
+    auto ctx = ibv_open_device(dev);
+    if (!ctx) {
+        debug::notify_error("Failed to ibv_open_device");
+        return nullptr;
+    }
+
+    ibv_free_device_list(dev_list);
+
+    if (g_is_server) {
+        struct ibv_exp_device_attr device_attr;
+        memset(&device_attr, 0, sizeof(device_attr));
+        device_attr.comp_mask = IBV_EXP_DEVICE_ATTR_UMR | IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE;
+        if (ibv_exp_query_device(ctx, &device_attr)) {
+            debug::notify_error("Failed to ibv_exp_query_device");
+            return ctx;
+        }
+
+        if (!(device_attr.comp_mask & IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE)
+            || (device_attr.max_dm_size == 0)) {
+            debug::notify_error("This RNIC does not support device memory");
+            assert(false);
+            return ctx;
+        }
+        debug::notify_info("Max Device memory = %lu KB\n", device_attr.max_dm_size / 1024);
+    }
+    return ctx;
+}
+
+struct ibv_pd* transport_t::alloc_pd(struct ibv_context* ctx) {
+    auto pd = ibv_alloc_pd(ctx);
+    if (!pd) {
+        debug::notify_error("Failed to ibv_alloc_pd");
+        return nullptr;
+    }
+    return pd;
+}
+
+bool transport_t::query_attr(struct ibv_context* ctx, struct ibv_port_attr& attr, int& gid_idx, union ibv_gid& gid) {
+    memset(&attr, 0, sizeof(attr));
+
+    if (ibv_query_port(ctx, IB_PORT, &attr)) {
+        debug::notify_error("Failed to ibv_query_port");
+        return false;
+    }
+
+    if (ibv_query_gid(ctx, IB_PORT, gid_idx, &gid)) {
+        debug::notify_error("Failed to ibv_query_gid");
+        return false;
+    }
+    return true;
+}
+
+struct ibv_cq* transport_t::create_cq(struct ibv_context* ctx){
+    auto cq = ibv_create_cq(ctx, QP_DEPTH, nullptr, nullptr, 0);
+    if(!cq){
+        debug::notify_error("Failed to ibv_create_cq");
+        return nullptr;
+    }
+    return cq;
+}
+
+struct ibv_qp* transport_t::create_qp(struct ibv_pd* pd, struct ibv_cq* send_cq, struct ibv_cq* recv_cq){
+    struct ibv_qp_init_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_type = IBV_QPT_RC;
+    attr.send_cq = send_cq;
+    attr.recv_cq = recv_cq;
+
+    attr.cap.max_send_wr = QP_DEPTH;
+    attr.cap.max_recv_wr = QP_DEPTH;
+    attr.cap.max_send_sge = 1;
+    attr.cap.max_recv_sge = 1;
+    attr.cap.max_inline_data = 512;
+
+    auto qp = ibv_create_qp(pd, &attr);
+    if (!qp) {
+        debug::notify_error("Failed to ibv_create_qp");
+        return nullptr;
+    }
+
+    return qp;
+}
+
+struct ibv_mr* transport_t::register_mr(struct ibv_pd* pd, void* addr, uint64_t size) {
+    int flags = IBV_ACCESS_LOCAL_WRITE |
+                IBV_ACCESS_REMOTE_READ |
+                IBV_ACCESS_REMOTE_WRITE |
+                IBV_ACCESS_REMOTE_ATOMIC;
+    auto mr = ibv_reg_mr(pd, addr, size, flags);
+    if (!mr) {
+        debug::notify_error("Failed to ibv_reg_mr");
+        return nullptr;
+    }
+    return mr;
+}
+
+struct ibv_mr* transport_t::register_mr_device(struct ibv_context* ctx, struct ibv_pd* pd, void* addr, uint64_t size) {
+    struct ibv_exp_alloc_dm_attr dm_attr;
+    memset(&dm_attr, 0, sizeof(dm_attr));
+    dm_attr.length = size;
+    struct ibv_exp_dm* dm = ibv_exp_alloc_dm(ctx, &dm_attr);
+    if (!dm) {
+        debug::notify_error("Failed to ibv_exp_alloc_dm");
+        return nullptr;
+    }
+
+    struct ibv_exp_reg_mr_in mr_in;
+    memset(&mr_in, 0, sizeof(mr_in));
+    int flags = IBV_ACCESS_LOCAL_WRITE |
+                IBV_ACCESS_REMOTE_READ |
+                IBV_ACCESS_REMOTE_WRITE |
+                IBV_ACCESS_REMOTE_ATOMIC;
+    mr_in.pd = pd;
+    mr_in.addr = (void*)addr;
+    mr_in.dm = dm;
+    mr_in.length = size;
+    // mr_in.create_flags = 0;
+    mr_in.exp_access = flags;
+    mr_in.comp_mask = IBV_EXP_REG_MR_DM;
+    struct ibv_mr* mr = ibv_exp_reg_mr(&mr_in);
+    if (!mr) {
+        debug::notify_error("Failed to ibv_exp_reg_dm_mr");
+        return nullptr;
+    }
+
+    // init the memory to zero
+    char* buffer = (char*)malloc(size);
+    memset(buffer, 0, size);
+    assert(buffer);
+
+    struct ibv_exp_memcpy_dm_attr memcpy_attr;
+    memset(&memcpy_attr, 0, sizeof(memcpy_attr));
+    memcpy_attr.memcpy_dir = IBV_EXP_DM_CPY_TO_DEVICE;
+    memcpy_attr.host_addr = (void*)buffer;
+    memcpy_attr.length = size;
+    memcpy_attr.dm_offset = 0;
+    ibv_exp_memcpy_dm(dm, &memcpy_attr);
+    free(buffer);
+
+    return mr;
+}
+
+bool transport_t::modify_qp_state_to_init(struct ibv_qp* qp) {
+    struct ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+
+    attr.qp_state = IBV_QPS_INIT;
+    attr.port_num = IB_PORT;
+    attr.pkey_index = 0;
+    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |
+                           IBV_ACCESS_REMOTE_READ |
+                          IBV_ACCESS_REMOTE_WRITE |
+                          IBV_ACCESS_REMOTE_ATOMIC;
+
+    int flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+                IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
+
+    if (ibv_modify_qp(qp, &attr, flags)) {
+        debug::notify_error("Failed to modify QP state to INIT");
+        return false;
+    }
+    return true;
+}
+
+bool transport_t::modify_qp_state_to_rtr(struct ibv_qp* qp, union ibv_gid dest_gid, int gid_idx, uint32_t lid, uint32_t qpn) {
+    struct ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+
+    attr.qp_state = IBV_QPS_RTR;
+    attr.path_mtu = IBV_MTU_1024;
+    attr.dest_qp_num = qpn;
+    attr.rq_psn = 3185;
+    attr.max_dest_rd_atomic = 16;
+    attr.min_rnr_timer = 12;
+
+    attr.ah_attr.is_global = 1;
+    attr.ah_attr.dlid = lid;
+    attr.ah_attr.sl = 0;
+    attr.ah_attr.src_path_bits = 0;
+    attr.ah_attr.port_num = IB_PORT;
+    memcpy(&attr.ah_attr.grh.dgid, &dest_gid, sizeof(dest_gid));
+    attr.ah_attr.grh.flow_label = 0;
+    attr.ah_attr.grh.hop_limit = 1;
+    attr.ah_attr.grh.sgid_index = gid_idx;
+    attr.ah_attr.grh.traffic_class = 0;
+
+    int flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+
+    if (ibv_modify_qp(qp, &attr, flags)) {
+        debug::notify_error("Failed to modify QP state to RTR");
+        return false;
+    }
+    return true;
+}
+
+bool transport_t::modify_qp_state_to_rts(struct ibv_qp* qp) {
+    struct ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+
+    attr.qp_state = IBV_QPS_RTS;
+    attr.timeout = 14;
+    attr.retry_cnt = 7;
+    attr.rnr_retry = 7; // infinite retry
+    attr.sq_psn = 3185;
+    attr.max_rd_atomic = 16;
+
+    int flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
+
+    if (ibv_modify_qp(qp, &attr, flags)) {
+        debug::notify_error("Failed to modify QP state to RTS");
+        return false;
+    }
+    return true;
+}
+
+char* transport_t::get_buffer(){
+    return _rdma_send_buffer[GET_THD_ID];
+}
+
+char* transport_t::get_recv_buffer(uint32_t node_id) {
+    return _rdma_recv_buffer[node_id][GET_THD_ID];
+}
+
+char* transport_t::get_recv_buffer(uint32_t node_id, uint32_t qp_id) {
+    return _rdma_recv_buffer[node_id][qp_id];
+}
+
+uint64_t transport_t::serialize_node_info(uint32_t node_id, uint32_t qp_id) {
+    return ((uint64_t)node_id << 32) | qp_id;
+}
+
+void transport_t::deserialize_node_info(uint64_t data, uint32_t& node_id, uint32_t& qp_id) {
+    qp_id = data & 0xffffffff;
+    node_id = (data >> 32);
+}
+
+bool transport_t::post_send(struct ibv_qp* qp, char* src, uint32_t size, uint32_t lkey, bool signaled) {
+    struct ibv_sge list;
+    struct ibv_send_wr wr;
+    struct ibv_send_wr *wr_bad;
+
+    memset(&list, 0, sizeof(list));
+    memset(&wr, 0, sizeof(wr));
+
+    list.addr = (uintptr_t)src;
+    list.length = size;
+    list.lkey = lkey;
+
+    wr.sg_list = &list;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+    wr.send_flags |= (size <= 512) ? IBV_SEND_INLINE : 0; // use inline if size is small
+    
+    if (ibv_post_send(qp, &wr, &wr_bad)) {
+        debug::notify_error("Failed to ibv_post_send (RDMA SEND)");
+        assert(false);
+        return false;
+    }
+    return true;
+}
+
+bool post_send_imm(struct ibv_qp* qp, char* src, uint32_t size, uint32_t lkey, uint32_t imm_data, bool signaled) {
+    struct ibv_sge list;
+    struct ibv_send_wr wr;
+    struct ibv_send_wr *wr_bad;
+
+    memset(&list, 0, sizeof(list));
+    memset(&wr, 0, sizeof(wr));
+
+    list.addr = (uintptr_t)src;
+    list.length = size;
+    list.lkey = lkey;
+
+    wr.sg_list    = &list;
+    wr.num_sge    = 1;
+    wr.imm_data   = imm_data;
+    wr.opcode     = IBV_WR_SEND_WITH_IMM;
+    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+    wr.send_flags = (size <= 512) ? (wr.send_flags | IBV_SEND_INLINE) : wr.send_flags;
+    
+    if(ibv_post_send(qp, &wr, &wr_bad)){
+        debug::notify_error("Failed to ibv_post_send (RDMA SEND)");
+        assert(false);
+        return false;
+    }
+    return true;
+}
+
+bool transport_t::post_recv(struct ibv_qp* qp, char* src, uint32_t size, uint32_t lkey, uint64_t wr_id) {
+    struct ibv_sge list;
+    struct ibv_recv_wr wr;
+    struct ibv_recv_wr* wr_bad;
+
+    memset(&list, 0, sizeof(list));
+    memset(&wr, 0, sizeof(wr));
+
+    list.addr = (uintptr_t)src;
+    list.length = size;
+    list.lkey = lkey;
+
+    wr.wr_id = wr_id;
+    wr.sg_list = &list;
+    wr.num_sge = 1;
+
+    if(ibv_post_recv(qp, &wr, &wr_bad)){
+        debug::notify_error("Failed to ibv_post_recv");
+    	assert(false);
+        return false;
+    }
+    return true;
+}
+
+bool transport_t::post_faa(struct ibv_qp* qp, char* src, uint64_t dest, uint64_t add, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled){
+    struct ibv_sge list;
+    struct ibv_send_wr wr;
+    struct ibv_send_wr* wr_bad;
+
+    assert(size <= 8);
+    memset(&list, 0, sizeof(list));
+    memset(&wr, 0, sizeof(wr));
+
+    list.addr = (uintptr_t)src;
+    list.length = size;
+    list.lkey   = lkey;
+
+    wr.wr_id      = 0;
+    wr.sg_list    = &list;
+    wr.num_sge    = 1;
+    wr.opcode     = IBV_WR_ATOMIC_FETCH_AND_ADD;
+    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+    wr.wr.atomic.remote_addr = dest;
+    wr.wr.atomic.rkey = rkey;
+    wr.wr.atomic.compare_add = add;
+
+    if(ibv_post_send(qp, &wr, &wr_bad)){
+        debug::notify_error("Failed to ibv_post_send (RDMA FAA)");
+    	assert(false);
+        return false;
+    }
+    return true;
+}
+
+bool transport_t::post_faa_bound(struct ibv_qp* qp, char* src, uint64_t dest, uint64_t add, uint64_t boundary, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled){
+    struct ibv_sge list;
+    struct ibv_exp_send_wr wr;
+    struct ibv_exp_send_wr* wr_bad;
+
+    assert(size <= 8);
+    memset(&list, 0, sizeof(list));
+    memset(&wr, 0, sizeof(wr));
+
+    list.addr = (uintptr_t)src;
+    list.length = 1 << size;
+    list.lkey   = lkey;
+
+    wr.wr_id      = 0;
+    wr.sg_list    = &list;
+    wr.num_sge    = 1;
+
+    wr.exp_opcode = IBV_EXP_WR_EXT_MASKED_ATOMIC_FETCH_AND_ADD;
+    wr.exp_send_flags = IBV_EXP_SEND_EXT_ATOMIC_INLINE;
+    if (signaled) wr.exp_send_flags |= IBV_SEND_SIGNALED;
+    wr.ext_op.masked_atomics.remote_addr = dest;
+    wr.ext_op.masked_atomics.rkey = rkey;
+    wr.ext_op.masked_atomics.log_arg_sz = size;
+
+    auto& op = wr.ext_op.masked_atomics.wr_data.inline_data.op.fetch_add;
+    op.add_val = add;
+    op.field_boundary = boundary;
+
+    // First, try to check if device supports extended atomics
+    static bool ext_atomics_checked = false;
+    static bool ext_atomics_supported = false;
+    
+    if (!ext_atomics_checked) {
+        struct ibv_exp_device_attr device_attr;
+        memset(&device_attr, 0, sizeof(device_attr));
+        device_attr.comp_mask = IBV_EXP_DEVICE_ATTR_EXT_ATOMIC_ARGS;
+        
+        if (ibv_exp_query_device(_context.ctx, &device_attr) == 0 &&
+            (device_attr.comp_mask & IBV_EXP_DEVICE_ATTR_EXT_ATOMIC_ARGS)) {
+            ext_atomics_supported = true;
+            printf("Device supports extended masked atomics\n");
+        } else {
+            ext_atomics_supported = false;
+            printf("Device does not support extended masked atomics, using regular FAA\n");
+        }
+        ext_atomics_checked = true;
+    }
+    
+    if (!ext_atomics_supported) {
+        // Fall back to regular fetch-and-add (ignoring boundary)
+        assert(false);
+        printf("Warning: Boundary parameter ignored, using regular FAA\n");
+        return post_faa(qp, src, dest, add, size, lkey, rkey);
+    }
+
+    int ret = ibv_exp_post_send(qp, &wr, &wr_bad);
+    if (ret != 0) {
+        // Capture errno immediately after the failed call
+        int saved_errno = errno;
+        
+        printf("ERROR: ibv_exp_post_send failed!\n");
+        printf("  Return code: %d\n", ret);
+        printf("  errno: %d (%s)\n", saved_errno, strerror(saved_errno));
+        
+        // Print common RDMA error meanings
+        switch(ret) {
+            case EINVAL:
+                printf("  EINVAL: Invalid parameter - check WR fields, QP state, or unsupported operation\n");
+                break;
+            case ENOMEM:
+                printf("  ENOMEM: Insufficient memory or resources\n");
+                break;
+            case EFAULT:
+                printf("  EFAULT: Bad address in WR or buffer\n");
+                break;
+            case ENOSYS:
+                printf("  ENOSYS: Function not implemented - device may not support extended atomics\n");
+                break;
+            default:
+                printf("  Unknown error code\n");
+                break;
+        }
+        
+        // Check if it's a WR-specific error
+        if (wr_bad) {
+            printf("  Bad WR detected at: %p\n", wr_bad);
+            printf("  Bad WR opcode: %d\n", wr_bad->exp_opcode);
+        }
+        
+        // Additional debugging - check QP state
+        struct ibv_qp_attr qp_attr;
+        struct ibv_qp_init_attr qp_init_attr;
+        int attr_mask = IBV_QP_STATE;
+        if (ibv_query_qp(qp, &qp_attr, attr_mask, &qp_init_attr) == 0) {
+            printf("  QP State: %d (should be %d for RTS)\n", qp_attr.qp_state, IBV_QPS_RTS);
+        }
+        assert(false);
+    }
+    if(ibv_exp_post_send(qp, &wr, &wr_bad)){
+        debug::notify_error("Failed to ibv_post_send (RDMA FAA BOUNDARY)");
+    	assert(false);
+        return false;
+    }
+    return true;
+}
+
+bool transport_t::post_cas(struct ibv_qp* qp, char* src, uint64_t dest, uint64_t expected, uint64_t desired, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled){
+    struct ibv_sge list;
+    struct ibv_send_wr wr;
+    struct ibv_send_wr* wr_bad;
+
+    assert(size <= 8);
+    memset(&list, 0, sizeof(list));
+    memset(&wr, 0, sizeof(wr));
+
+    list.addr = (uintptr_t)src;
+    list.length = size;
+    list.lkey   = lkey;
+
+    wr.wr_id      = 0;
+    wr.sg_list    = &list;
+    wr.num_sge    = 1;
+    wr.opcode     = IBV_WR_ATOMIC_CMP_AND_SWP;
+    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+    wr.wr.atomic.remote_addr = dest;
+    wr.wr.atomic.rkey = rkey;
+    wr.wr.atomic.compare_add = expected;
+    wr.wr.atomic.swap = desired;
+
+    if(ibv_post_send(qp, &wr, &wr_bad)){
+        debug::notify_error("Failed to ibv_post_send (RDMA CAS)");
+    	assert(false);
+        return false;
+    }
+    return true;
+}
+
+bool transport_t::post_cas_mask(struct ibv_qp* qp, char* src, uint64_t dest, uint64_t expected, uint64_t desired, uint64_t mask, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled){
+    struct ibv_sge list;
+    struct ibv_exp_send_wr wr;
+    struct ibv_exp_send_wr* wr_bad;
+
+    assert(size <= 8);
+    // memset(&list, 0, sizeof(list));
+    memset(&wr, 0, sizeof(wr));
+
+    list.addr = (uintptr_t)src;
+    list.length = 1 << size;
+    list.lkey   = lkey;
+
+    wr.wr_id      = 0;
+    wr.sg_list    = &list;
+    wr.num_sge    = 1;
+
+    wr.exp_opcode = IBV_EXP_WR_EXT_MASKED_ATOMIC_CMP_AND_SWP;
+    wr.exp_send_flags = IBV_EXP_SEND_EXT_ATOMIC_INLINE;
+    if (signaled) wr.exp_send_flags |= IBV_EXP_SEND_SIGNALED;
+
+    wr.ext_op.masked_atomics.log_arg_sz = size;
+    wr.ext_op.masked_atomics.remote_addr = dest;
+    wr.ext_op.masked_atomics.rkey = rkey;
+    
+    auto& op = wr.ext_op.masked_atomics.wr_data.inline_data.op.cmp_swap;
+    op.compare_val = expected;
+    op.swap_val = desired;
+    op.compare_mask = mask;
+    op.swap_mask = mask;
+
+    {
+        struct ibv_device_attr device_attr;
+    if (ibv_query_device(_context.ctx, &device_attr) == 0) {
+        printf("=== Device Information ===\n");
+        printf("Device name: %s\n", ibv_get_device_name(_context.ctx->device));
+        printf("Vendor ID: 0x%x\n", device_attr.vendor_id);
+        printf("Vendor part ID: 0x%x\n", device_attr.vendor_part_id);
+        printf("HW version: 0x%x\n", device_attr.hw_ver);
+        printf("FW version: %s\n", device_attr.fw_ver);
+        
+        // Mellanox devices
+        if (device_attr.vendor_id == 0x02c9) {  // Mellanox vendor ID
+            printf("Mellanox device detected\n");
+            switch (device_attr.vendor_part_id) {
+                case 4115:  // ConnectX-4
+                    printf("ConnectX-4: Limited extended atomic support\n");
+                    break;
+                case 4117:  // ConnectX-4 Lx
+                    printf("ConnectX-4 Lx: Limited extended atomic support\n");
+                    break;
+                case 4119:  // ConnectX-5
+                    printf("ConnectX-5: Better extended atomic support\n");
+                    break;
+                case 4121:  // ConnectX-6
+                    printf("ConnectX-6: Full extended atomic support\n");
+                    break;
+                default:
+                    printf("Unknown Mellanox device: 0x%x\n", device_attr.vendor_part_id);
+            }
+        }
+        
+        printf("Atomic capabilities: 0x%x\n", device_attr.atomic_cap);
+        printf("Max QP RD atomic: %d\n", device_attr.max_qp_rd_atom);
+        printf("Max EE RD atomic: %d\n", device_attr.max_ee_rd_atom);
+    }
+    }
+
+    {
+    struct ibv_exp_device_attr device_attr;
+    memset(&device_attr, 0, sizeof(device_attr));
+    
+    // Query multiple capability masks
+    device_attr.comp_mask = IBV_EXP_DEVICE_ATTR_EXT_ATOMIC_ARGS | 
+                           IBV_EXP_DEVICE_ATTR_UMR |
+                           IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE;
+
+    if (ibv_exp_query_device(_context.ctx, &device_attr) == 0) {
+        printf("=== Extended Atomic Capabilities ===\n");
+        printf("comp_mask: 0x%lx\n", device_attr.comp_mask);
+        
+        if (device_attr.comp_mask & IBV_EXP_DEVICE_ATTR_EXT_ATOMIC_ARGS) {
+            printf("Extended atomic args supported\n");
+            printf("Max FA bit boundary: %d\n", device_attr.ext_atom.max_fa_bit_boundary);
+            printf("Log max atomic inline: %d\n", device_attr.ext_atom.log_max_atomic_inline);
+            
+            // Check if specific fields exist (may vary by driver version)
+            printf("Extended atomic struct size: %zu bytes\n", sizeof(device_attr.ext_atom));
+            
+            // Print raw bytes to see what's in the structure
+            printf("Raw ext_atom data: ");
+            uint8_t* raw = (uint8_t*)&device_attr.ext_atom;
+            for (size_t i = 0; i < sizeof(device_attr.ext_atom); i++) {
+                printf("%02x ", raw[i]);
+            }
+            printf("\n");
+        } else {
+            printf("Extended atomic args NOT supported\n");
+        }
+        
+        if (device_attr.comp_mask & IBV_EXP_DEVICE_ATTR_UMR) {
+            printf("UMR (User Memory Registration) supported\n");
+        }
+        
+        if (device_attr.comp_mask & IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE) {
+            printf("Device memory size: %lu KB\n", device_attr.max_dm_size / 1024);
+        }
+    } else {
+        printf("Failed to query extended device attributes\n");
+    }
+    }
+
+
+    // Test different mask patterns
+    uint64_t test_masks[] = {
+        0x1,                    // Single bit (your current - fails)
+        0x3,                    // Two contiguous bits
+        0xF,                    // Four contiguous bits  
+        0xFF,                   // Byte mask
+        0xFFFF,                 // 2-byte mask
+        0xFFFFFFFF,             // 4-byte mask
+        0xFFFFFFFFFFFFFFFF,     // Full 8-byte mask
+        0xFFFFFFFFFFFFFFFE,     // All bits except LSB
+        0x5555555555555555,     // Alternating bits
+        0xAAAAAAAAAAAAAAAA      // Other alternating bits
+    };
+    
+    for (int i = 0; i < sizeof(test_masks)/sizeof(uint64_t); i++) {
+        struct ibv_exp_send_wr wr;
+        struct ibv_exp_send_wr* wr_bad;
+        struct ibv_sge list;
+        
+        memset(&wr, 0, sizeof(wr));
+        memset(&list, 0, sizeof(list));
+        
+        list.addr = (uintptr_t)src;
+        list.length = 8;
+        list.lkey = lkey;
+        
+        wr.sg_list = &list;
+        wr.num_sge = 1;
+        wr.exp_opcode = IBV_EXP_WR_EXT_MASKED_ATOMIC_CMP_AND_SWP;
+        wr.exp_send_flags = IBV_EXP_SEND_EXT_ATOMIC_INLINE;
+        wr.ext_op.masked_atomics.log_arg_sz = 3;
+        wr.ext_op.masked_atomics.remote_addr = (uintptr_t)dest;
+        wr.ext_op.masked_atomics.rkey = rkey;
+        
+        auto& op = wr.ext_op.masked_atomics.wr_data.inline_data.op.cmp_swap;
+        op.compare_val = 0;
+        op.swap_val = 1;
+        op.compare_mask = test_masks[i];
+        op.swap_mask = test_masks[i];
+        
+        int ret = ibv_exp_post_send(qp, &wr, &wr_bad);
+        printf("Mask 0x%016lx: %s\n", test_masks[i], ret == 0 ? "WORKS" : "FAILS");
+    }
+
+    printf("DEBUG CAS_MASK: dest=0x%lx (aligned: %s), expected=%lu, desired=%lu\n", 
+       dest, (dest % 8 == 0) ? "YES" : "NO", expected, desired);
+printf("DEBUG CAS_MASK: mask=0x%lx, size=%u, log_arg_sz=%u\n", 
+       mask, size, wr.ext_op.masked_atomics.log_arg_sz);
+printf("DEBUG CAS_MASK: compare_mask=0x%lx, swap_mask=0x%lx\n",
+       op.compare_mask, op.swap_mask);
+
+    int ret = ibv_exp_post_send(qp, &wr, &wr_bad);
+    if (ret != 0) {
+        // Capture errno immediately after the failed call
+        int saved_errno = errno;
+        
+        printf("ERROR: ibv_exp_post_send failed!\n");
+        printf("  Return code: %d\n", ret);
+        printf("  errno: %d (%s)\n", saved_errno, strerror(saved_errno));
+        
+        // Print common RDMA error meanings
+        switch(ret) {
+            case EINVAL:
+                printf("  EINVAL: Invalid parameter - check WR fields, QP state, or unsupported operation\n");
+                break;
+            case ENOMEM:
+                printf("  ENOMEM: Insufficient memory or resources\n");
+                break;
+            case EFAULT:
+                printf("  EFAULT: Bad address in WR or buffer\n");
+                break;
+            case ENOSYS:
+                printf("  ENOSYS: Function not implemented - device may not support extended atomics\n");
+                break;
+            default:
+                printf("  Unknown error code\n");
+                break;
+        }
+        
+        // Check if it's a WR-specific error
+        if (wr_bad) {
+            printf("  Bad WR detected at: %p\n", wr_bad);
+            printf("  Bad WR opcode: %d\n", wr_bad->exp_opcode);
+        }
+        
+        // Additional debugging - check QP state
+        struct ibv_qp_attr qp_attr;
+        struct ibv_qp_init_attr qp_init_attr;
+        int attr_mask = IBV_QP_STATE;
+        if (ibv_query_qp(qp, &qp_attr, attr_mask, &qp_init_attr) == 0) {
+            printf("  QP State: %d (should be %d for RTS)\n", qp_attr.qp_state, IBV_QPS_RTS);
+        }
+        assert(false);
+    }
+
+    // if(ibv_exp_post_send(qp, &wr, &wr_bad)){
+    //     debug::notify_error("Failed to ibv_post_send (RDMA CAS MASK)");
+    // 	assert(false);
+    //     return false;
+    // }
+    return true;
+}
+
+bool transport_t::post_read(struct ibv_qp* qp, char* src, uint64_t dest, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled){
+    struct ibv_sge list;
+    struct ibv_send_wr wr;
+    struct ibv_send_wr* wr_bad;
+
+    memset(&list, 0, sizeof(list));
+    memset(&wr, 0, sizeof(wr));
+
+    list.addr = (uintptr_t)src;
+    list.length = size;
+    list.lkey   = lkey;
+
+    wr.wr_id      = 0;
+    wr.sg_list    = &list;
+    wr.num_sge    = 1;
+    wr.opcode     = IBV_WR_RDMA_READ;
+    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+    wr.wr.rdma.remote_addr = dest;
+    wr.wr.rdma.rkey = rkey;
+
+    if(ibv_post_send(qp, &wr, &wr_bad)){
+        debug::notify_error("Failed to ibv_post_send (RDMA READ)");
+    	assert(false);
+        return false;
+    }
+    return true;
+}
+
+bool transport_t::post_write(struct ibv_qp* qp, char* src, uint64_t dest, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled){
+    struct ibv_sge list;
+    struct ibv_send_wr wr;
+    struct ibv_send_wr* wr_bad;
+
+    memset(&list, 0, sizeof(list));
+    memset(&wr, 0, sizeof(wr));
+
+    list.addr = (uintptr_t)src;
+    list.length = size;
+    list.lkey = lkey;
+
+    wr.wr_id      = 0;
+    wr.sg_list    = &list;
+    wr.num_sge    = 1;
+    wr.opcode     = IBV_WR_RDMA_WRITE;
+    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+    wr.send_flags |= (size <= 512) ? IBV_SEND_INLINE : 0;
+    wr.wr.rdma.remote_addr = dest;
+    wr.wr.rdma.rkey = rkey;
+
+    if(ibv_post_send(qp, &wr, &wr_bad)){
+        debug::notify_error("Failed to ibv_post_send (RDMA WRITE)");
+    	assert(false);
+        return false;
+    }
+    return true;
+}
+
+int transport_t::poll_cq(struct ibv_cq* cq, int num_entries, struct ibv_wc* wc) {
+    int total_wc = 0;
+    while (total_wc < num_entries) {
+        int ne = ibv_poll_cq(cq, num_entries - total_wc, wc + total_wc);
+        if (ne < 0) {
+            debug::notify_error("Failed to poll CQ");
+            return -1;
+        }
+        total_wc += ne;
+    }
+    return total_wc;
+}
+
+
+int transport_t::poll_cq_once(struct ibv_cq* cq, int num_entries, struct ibv_wc* wc) {
+    int cnt = ibv_poll_cq(cq, num_entries, wc);
+    if (cnt < 0) {
+        debug::notify_error("Failed to ibv_poll_cq once ---- status %s (%d)", ibv_wc_status_str(wc->status), wc->status);
+        assert(false);
+    }
+    return cnt;
+}
+
+void transport_t::rdma_faa(struct ibv_qp* qp, struct ibv_cq* cq, char* src, uint64_t dest, uint64_t add, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled) {
+    bool ret = post_faa(qp, src, dest, add, size, lkey, rkey, signaled);
+    if (signaled) {
+        struct ibv_wc wc;
+        poll_cq(cq, 1, &wc);
+    }
+}
+
+void transport_t::rdma_faa_bound(struct ibv_qp* qp, struct ibv_cq* cq, char* src, uint64_t dest, uint64_t add, uint64_t boundary, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled) {
+    bool ret = post_faa_bound(qp, src, dest, add, boundary, size, lkey, rkey, signaled);
+    if (signaled) {
+        struct ibv_wc wc;
+        poll_cq(cq, 1, &wc);
+    }
+}
+
+bool transport_t::rdma_cas(struct ibv_qp* qp, struct ibv_cq* cq, char* src, uint64_t dest, uint64_t cmp, uint64_t swp, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled) {
+    bool ret = post_cas(qp, src, dest, cmp, swp, size, lkey, rkey, signaled);
+    if (signaled) {
+        struct ibv_wc wc;
+        poll_cq(cq, 1, &wc);
+        return cmp == *reinterpret_cast<uint64_t*>(src);
+    }
+    else
+        return true;
+}
+
+bool transport_t::rdma_cas_mask(struct ibv_qp* qp, struct ibv_cq* cq, char* src, uint64_t dest, uint64_t cmp, uint64_t swp, uint64_t mask, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled) {
+    bool ret = post_cas_mask(qp, src, dest, cmp, swp, mask, size, lkey, rkey, signaled);
+    if (signaled) {
+        struct ibv_wc wc;
+        poll_cq(cq, 1, &wc);
+
+        if (size <= 3) {
+            return (cmp & mask) == (*reinterpret_cast<uint64_t*>(src) & mask);
+        }
+        else {
+            uint64_t* eq = reinterpret_cast<uint64_t*>(cmp);
+            uint64_t* old = reinterpret_cast<uint64_t*>(src);
+            uint64_t* m = reinterpret_cast<uint64_t*>(mask);
+            for (int i=0; i<(1 << (size - 3)); i++) {
+                if ((eq[i] & m[i]) != (__bswap_64(old[i] & m[i]))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+    else
+        return true;
+}
+
+void transport_t::rdma_read(struct ibv_qp* qp, struct ibv_cq* cq, char* src, uint64_t dest, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled) {
+    post_read(qp, src, dest, size, lkey, rkey, signaled);
+    if (signaled) {
+        struct ibv_wc wc;
+        poll_cq(cq, 1, &wc);
+    }
+}
+
+void transport_t::rdma_write(struct ibv_qp* qp, struct ibv_cq* cq, char* src, uint64_t dest, uint32_t size, uint32_t lkey, uint32_t rkey, bool signaled) {
+    post_write(qp, src, dest, size, lkey, rkey, signaled);
+    if (signaled) {
+        struct ibv_wc wc;
+        poll_cq(cq, 1, &wc);
+    }
+}
+
+void transport_t::rdma_send(struct ibv_qp* qp, struct ibv_cq* cq, char* src, uint32_t size, uint32_t lkey, bool signaled) {
+    post_send(qp, src, size, lkey, signaled);
+    if (signaled) {
+        struct ibv_wc wc;
+        poll_cq(cq, 1, &wc);
+    }
+}
+
+// this is synchronous
+void transport_t::rdma_recv(struct ibv_qp* qp, struct ibv_cq* cq, char* src, uint32_t size, uint32_t lkey, uint64_t wr_id) {
+    struct ibv_wc wc;
+    post_recv(qp, src, size, lkey, wr_id);
+    poll_cq(cq, 1, &wc);
+}
+
+void transport_t::rdma_recv_prepost(struct ibv_qp* qp, char* src, uint32_t size, uint32_t lkey, uint64_t wr_id) {
+    post_recv(qp, src, size, lkey, wr_id);
+}

@@ -1,0 +1,35 @@
+{
+    "RUN_TIME": 10,
+    "WARMUP_TIME": 10,
+    "NDEBUG": "true",
+    "STATS_ENABLE": "true",
+    "TIME_ENABLE": "true",
+    "COLLECT_LATENCY": "true",
+    "TRANSPORT": "TWO_SIDED",
+    "BATCH": 0,
+    "PARTITIONED": "false",
+
+    "RPC_RATE": 0.1,
+    "CACHE_SIZE": 160,
+    "CACHE_ADMISSION_RATE": 0.5,
+
+    "NUM_SERVER_THREADS": 8,
+    "NUM_CLIENT_THREADS": 40,
+
+    "TXN_TYPE": "STORED_PROCEDURE",
+    "CC_ALG": "WAIT_DIE",
+
+    "WORKLOAD": "TPCC",
+    "NUM_WH": 16,
+    "PERC_PAYMENT": 0.431,
+    "PERC_NEWORDER": 0.445,
+    "PERC_ORDERSTATUS": 0.041,
+    "PERC_DELIVERY": 0.042,
+    "PERC_STOCKLEVEL": 0.041,
+    "PAYMENT_REMOTE_PERC": 0.15,
+    "NEW_ORDER_REMOTE_PERC": 0.15,
+    "FIRSTNAME_MINLEN": 8,
+    "FIRSTNAME_LEN": 16,
+    "LASTNAME_LEN": 16,
+    "DIST_PER_WARE": 10
+}

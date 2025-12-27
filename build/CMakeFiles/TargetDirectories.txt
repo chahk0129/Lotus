@@ -1,0 +1,7 @@
+/proj/nextgendb-PG0/hcha/disaggregated_memory_db/build/CMakeFiles/db_core.dir
+/proj/nextgendb-PG0/hcha/disaggregated_memory_db/build/CMakeFiles/idx_test.dir
+/proj/nextgendb-PG0/hcha/disaggregated_memory_db/build/CMakeFiles/skiplist_test.dir
+/proj/nextgendb-PG0/hcha/disaggregated_memory_db/build/CMakeFiles/run_compute.dir
+/proj/nextgendb-PG0/hcha/disaggregated_memory_db/build/CMakeFiles/run_memory.dir
+/proj/nextgendb-PG0/hcha/disaggregated_memory_db/build/CMakeFiles/edit_cache.dir
+/proj/nextgendb-PG0/hcha/disaggregated_memory_db/build/CMakeFiles/rebuild_cache.dir
