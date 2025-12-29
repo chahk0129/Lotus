@@ -1,1 +1,0 @@
-/usr/bin/c++  -march=native -Wno-deprecated-declarations  -march=native -Wno-deprecated-declarations -O3 CMakeFiles/idx_test.dir/test/local_tree.cpp.o -o idx_test  libdb_core.a -lpthread -libverbs -ljemalloc -lcityhash -lboost_system -lboost_coroutine 

@@ -1,1 +1,0 @@
-/usr/bin/c++  -march=native -Wno-deprecated-declarations  -march=native -Wno-deprecated-declarations -O3 CMakeFiles/skiplist_test.dir/test/skiplist.cpp.o -o skiplist_test  libdb_core.a -lpthread -libverbs -ljemalloc -lcityhash -lboost_system -lboost_coroutine 
