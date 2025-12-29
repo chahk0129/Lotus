@@ -3,13 +3,13 @@
 Lotus is a disaggregated memory OLTP system that uses RDMA for network communication between compute servers and memory servers.
 
 ## System Architecture
-- **Compute Servers**: Execute transactions and maintain minimal local state
-- **Memory Servers**: Store indexes and tables, and support concurrency control
-- **RDMA Network**: Provides high-throughput, low-latency communication (two-sided/one-sided)
+- **Compute Servers**: execute transactions and maintain minimal local state
+- **Memory Servers**: store indexes and tables, and support concurrency control
+- **RDMA Network**: provides high-throughput, low-latency communication (two-sided/one-sided)
 
 ## Concurrency Control
 
-The system supports multiple concurrency control protocols in 2PL including `NO\_WAIT`, `WAIT\_DIE`, and `WOUND\_WAIT`.
+The system supports multiple concurrency control protocols in 2PL including `NO_WAIT`, `WAIT_DIE`, and `WOUND_WAIT`.
 
 
 ## Directory Structure
@@ -36,7 +36,7 @@ The system supports multiple concurrency control protocols in 2PL including `NO\
 ```bash
 bash scripts/install.sh # install dependencies
 bash scripts/hugepage.sh # allocate hugepage for RDMA MRs
-bash scripts/ntp.sh # synchronize NTP among servers
+bash scripts/ntp.sh # synchronize NTP among servers (timestamps)
 ```
 
 ## Configuration
